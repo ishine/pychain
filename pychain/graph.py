@@ -1,4 +1,5 @@
 # Copyright       2019 Yiwen Shao
+#                 2020 Yiming Wang
 
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -20,7 +21,10 @@ import simplefst
 
 class ChainGraph(object):
 
-    def __init__(self, fst=None, transitions=None, transition_probs=None, num_states=None, initial='simple'):
+    def __init__(
+        self, fst=None, transitions=None, transition_probs=None, num_states=None,
+        final_probs=None, initial='simple', leaky_hmm_coefficient=1.0e-05, is_denominator=True,
+    ):
         if fst:
             self.num_states = fst.num_states()
             if initial == 'simple':
@@ -36,13 +40,17 @@ class ChainGraph(object):
              self.forward_transition_indices,
              self.backward_transitions,
              self.backward_transition_probs,
-             self.backward_transition_indices) = simplefst.StdVectorFst.fst_to_tensor(
-                 fst)
+             self.backward_transition_indices,
+             self.final_probs) = simplefst.StdVectorFst.fst_to_tensor(fst)
+            if is_denominator:  # set final-probs to ones
+                self.final_probs = torch.ones(self.num_states, dtype=self.initial_probs.dtype)
 
         elif not (transitions is None and transition_probs is None and num_states is None):
             assert(transitions.size(0) == transition_probs.size(0))
             self.num_states = num_states
             self.initial_probs = self.simple_initial_probs
+            self.final_probs = final_probs
+            assert self.final_probs.size(0) == num_states
 
             (self.forward_transitions,
              self.forward_transition_probs,
@@ -61,6 +69,7 @@ class ChainGraph(object):
                              'should be provided to initialize a ChainGraph')
 
         self.num_transitions = self.forward_transitions.size(0)
+        self.leaky_hmm_coefficient = leaky_hmm_coefficient
 
     def simple_initial_probs(self):
         initial_probs = torch.zeros(self.num_states)
@@ -108,6 +117,7 @@ class ChainGraphBatch(object):
                 raise ValueError(
                     "batch size should be specified to expand a single graph")
             self.batch_size = batch_size
+            self.leaky_hmm_coefficient = graphs.leaky_hmm_coefficient
             self.initialized_by_one(graphs)
         elif isinstance(graphs, (list, ChainGraph)):
             if not max_num_transitions:
@@ -117,6 +127,7 @@ class ChainGraphBatch(object):
                 raise ValueError("max_num_states should be specified if given a "
                                  "a list of ChainGraph objects to initialize from")
             self.batch_size = len(graphs)
+            self.leaky_hmm_coefficient = graphs[0].leaky_hmm_coefficient
             self.initialized_by_list(
                 graphs, max_num_transitions, max_num_states)
         else:
@@ -140,6 +151,7 @@ class ChainGraphBatch(object):
             B, 1)
         self.initial_probs = graph.initial_probs
         self.num_states = graph.num_states
+        self.final_probs = graph.final_probs.repeat(B, 1)
 
     def initialized_by_list(self, graphs, max_num_transitions, max_num_states):
         transition_type = graphs[0].forward_transitions.dtype
@@ -159,6 +171,9 @@ class ChainGraphBatch(object):
             self.batch_size, max_num_states, 2, dtype=transition_type)
         self.backward_transition_probs = torch.zeros(
             self.batch_size, max_num_transitions, dtype=probs_type)
+        self.final_probs = torch.zeros(
+            self.batch_size, max_num_states, dtype=probs_type,
+        )
 
         for i in range(len(graphs)):
             graph = graphs[i]
@@ -176,6 +191,7 @@ class ChainGraphBatch(object):
                 graph.backward_transition_indices)
             self.backward_transition_probs[i, :num_transitions].copy_(
                 graph.backward_transition_probs)
+            self.final_probs[i, :num_states].copy_(graph.final_probs)
 
     def simple_initial_probs(self):
         initial_probs = torch.zeros(self.num_states)
